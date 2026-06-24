@@ -18,7 +18,7 @@
 
 ### ۱. ساخت Cloudflare Worker
 ۱. وارد [پیشخوان کلودفلر (Cloudflare Dashboard)](https://dash.cloudflare.com/) خود شوید.
-۲. از منوی کناری به مسیر **Workers & Pages** -> **Overview** بروید.
+۲. از منوی کناری به مسیر **Compute** -> **Workers & Pages** بروید.
 ۳. روی **Create Application** و سپس **Start with Hello World!** کلیک کنید.
 ۴. یک نام برای ورکر خود انتخاب کنید (مثلاً `moe-iptv`) و روی **Deploy** کلیک کنید.
 ۵. روی **Edit code** کلیک کنید. کدهای پیش‌فرض را پاک کنید، محتوای فایل `worker.js` از همین مخزن را در آن جای‌گذاری کرده و در نهایت روی **Save and deploy** کلیک کنید.
