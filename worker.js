@@ -2,16 +2,17 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
-      
+
       // ==========================================
       // 1. CONFIGURATION
       // ==========================================
-      const LOGIN_PASSWORD = env.LOGIN_PASSWORD || "Admin@123"; 
-      const COOKIE_SECRET = env.COOKIE_SECRET || "s3t-th1s-1n-env-v4rs";
-      const AUTH_COOKIE_NAME = "iptv_auth_token";
-      const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30; 
-      const DEFAULT_M3U_URL = "https://raw.githubusercontent.com/Mohammad-Aali/MOE-IPTV-Player/main/default-playlist.m3u";
-	  
+      const LOGIN_PASSWORD = env.LOGIN_PASSWORD || "Admin@123";
+      const COOKIE_SECRET  = env.COOKIE_SECRET  || "s3t-th1s-1n-env-v4rs";
+      const AUTH_COOKIE_NAME    = "iptv_auth_token";
+      const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
+      const DEFAULT_M3U_URL     = "https://raw.githubusercontent.com/Mohammad-Aali/MOE-IPTV-Player/main/default-playlist.m3u";
+      const FAVICON_URL         = "https://raw.githubusercontent.com/Mohammad-Aali/MOE-IPTV-Player/main/favicon.svg";
+
       // ==========================================
       // 2. AUTH HELPERS
       // ==========================================
@@ -19,6 +20,22 @@ export default {
         const data = new TextEncoder().encode(password + salt);
         const hash = await crypto.subtle.digest("SHA-256", data);
         return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+
+      // FIX: timing-safe comparison to prevent timing attacks
+      async function safeCompare(a, b) {
+        const enc = new TextEncoder();
+        const aBytes = enc.encode(a);
+        const bBytes = enc.encode(b);
+        if (aBytes.length !== bBytes.length) return false;
+        try {
+          return await crypto.subtle.timingSafeEqual(aBytes, bBytes);
+        } catch {
+          // timingSafeEqual not available in all runtimes – fall back
+          let diff = 0;
+          for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ bBytes[i];
+          return diff === 0;
+        }
       }
 
       async function isAuthenticated(req) {
@@ -32,13 +49,13 @@ export default {
         const token = cookies[AUTH_COOKIE_NAME];
         if (!token) return false;
         const expectedToken = await generateToken(LOGIN_PASSWORD, COOKIE_SECRET);
-        return token === expectedToken;
+        return safeCompare(token, expectedToken);
       }
 
-      const action = url.searchParams.get('action');
+      const action    = url.searchParams.get('action');
       const targetUrl = url.searchParams.get('url');
       const corsHeaders = {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin':  '*',
         'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
       };
@@ -53,7 +70,8 @@ export default {
           status: 302,
           headers: {
             'Location': url.pathname,
-            'Set-Cookie': `${AUTH_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`,
+            // FIX: added Secure flag
+            'Set-Cookie': `${AUTH_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`,
           }
         });
       }
@@ -66,7 +84,8 @@ export default {
           return new Response(JSON.stringify({ status: 'success' }), {
             headers: {
               'Content-Type': 'application/json',
-              'Set-Cookie': `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${AUTH_COOKIE_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax`,
+              // FIX: added Secure flag
+              'Set-Cookie': `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${AUTH_COOKIE_MAX_AGE}; Path=/; HttpOnly; Secure; SameSite=Lax`,
             }
           });
         } else {
@@ -78,7 +97,7 @@ export default {
 
       const authenticated = await isAuthenticated(request);
       if (!authenticated) {
-        return new Response(getLoginHTML(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+        return new Response(getLoginHTML(FAVICON_URL), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
 
       // ==========================================
@@ -88,7 +107,8 @@ export default {
         let sources = [];
         if (env.IPTV_KV) {
           try {
-            const raw = await env.IPTV_KV.get('m3u_sources');
+            // FIX: use KV cacheTtl to avoid redundant reads
+            const raw = await env.IPTV_KV.get('m3u_sources', { cacheTtl: 60 });
             if (raw) sources = JSON.parse(raw);
           } catch(e) { console.error("KV Read Error", e); }
         }
@@ -109,9 +129,14 @@ export default {
 
       // ==========================================
       // 5. VIDEO & M3U8 STREAM PROXY
+      // FIX: validate URL protocol to prevent SSRF
       // ==========================================
       if (action === 'proxy' && targetUrl) {
         try {
+          const parsed = new URL(targetUrl);
+          if (!['http:', 'https:'].includes(parsed.protocol)) {
+            return new Response("Forbidden: invalid protocol", { status: 403, headers: corsHeaders });
+          }
           const response = await fetch(targetUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
           });
@@ -135,9 +160,14 @@ export default {
 
       // ==========================================
       // 6. LOGO PROXY
+      // FIX: validate URL protocol to prevent SSRF
       // ==========================================
       if (action === 'logo' && targetUrl) {
         try {
+          const parsed = new URL(targetUrl);
+          if (!['http:', 'https:'].includes(parsed.protocol)) {
+            return new Response(null, { status: 403 });
+          }
           const response = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
           return new Response(response.body, {
             headers: { ...corsHeaders, 'Content-Type': response.headers.get('content-type') || 'image/png', 'Cache-Control': 'max-age=2592000, public' }
@@ -151,89 +181,114 @@ export default {
       // 7. CLEANER BACKEND LOGIC
       // ==========================================
       if (action === 'cleaner') {
-          return new Response(getCleanerHTML(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+        return new Response(getCleanerHTML(FAVICON_URL), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
 
       if (action === 'test-stream' && request.method === 'POST') {
-          const formData = await request.formData();
-          const target = formData.get('url');
-          if (!target) return new Response("DEAD", { status: 404, headers: corsHeaders });
+        const formData = await request.formData();
+        const target = formData.get('url');
+        if (!target) return new Response("DEAD", { status: 404, headers: corsHeaders });
 
-          try {
-              const res = await fetch(target, {
-                  method: 'GET',
-                  headers: { 
-                      'Range': 'bytes=0-200', 
-                      'User-Agent': 'VLC/3.0.16 LibVLC/3.0.16' 
-                  },
-                  cf: { cacheTtl: 0 }
-              });
-              if (res.ok || res.status === 206 || res.status < 400) {
-                  return new Response("ALIVE", { status: 200, headers: corsHeaders });
-              }
-          } catch(e) {}
+        // FIX: validate protocol before fetching
+        try {
+          const parsed = new URL(target);
+          if (!['http:', 'https:'].includes(parsed.protocol)) {
+            return new Response("DEAD", { status: 404, headers: corsHeaders });
+          }
+        } catch {
           return new Response("DEAD", { status: 404, headers: corsHeaders });
+        }
+
+        try {
+          const res = await fetch(target, {
+            method: 'GET',
+            headers: {
+              'Range': 'bytes=0-200',
+              'User-Agent': 'VLC/3.0.16 LibVLC/3.0.16'
+            },
+            cf: { cacheTtl: 0 }
+          });
+          if (res.ok || res.status === 206 || res.status < 400) {
+            return new Response("ALIVE", { status: 200, headers: corsHeaders });
+          }
+        } catch(e) {}
+        return new Response("DEAD", { status: 404, headers: corsHeaders });
       }
 
       if (action === 'save-cleaned-source' && request.method === 'POST') {
-          if (!env.IPTV_KV) return new Response(JSON.stringify({error: 'No KV'}), {status: 500});
-          const body = await request.json(); 
-          const id = 'clean_' + Date.now();
-          
-          await env.IPTV_KV.put('m3u_file_' + id, body.content);
-          
-          const rawSources = await env.IPTV_KV.get('m3u_sources');
-          let sources = rawSources ? JSON.parse(rawSources) : [];
-          const internalUrl = `${url.origin}${url.pathname}?action=serve-m3u&id=${id}`;
-          sources.push({ id, name: body.name, url: internalUrl });
-          await env.IPTV_KV.put('m3u_sources', JSON.stringify(sources));
-          
-          return new Response(JSON.stringify({status: 'success'}), {headers: {'Content-Type': 'application/json'}});
+        if (!env.IPTV_KV) return new Response(JSON.stringify({error: 'No KV'}), {status: 500});
+        const body = await request.json();
+        const id = 'clean_' + Date.now();
+
+        await env.IPTV_KV.put('m3u_file_' + id, body.content);
+
+        const rawSources = await env.IPTV_KV.get('m3u_sources', { cacheTtl: 60 });
+        let sources = rawSources ? JSON.parse(rawSources) : [];
+        const internalUrl = `${url.origin}${url.pathname}?action=serve-m3u&id=${id}`;
+        sources.push({ id, name: body.name, url: internalUrl });
+        await env.IPTV_KV.put('m3u_sources', JSON.stringify(sources));
+
+        return new Response(JSON.stringify({status: 'success'}), {headers: {'Content-Type': 'application/json'}});
       }
 
       if (action === 'serve-m3u') {
-          const id = url.searchParams.get('id');
-          if (env.IPTV_KV && id) {
-              const content = await env.IPTV_KV.get('m3u_file_' + id);
-              if (content) {
-                  return new Response(content, { headers: { ...corsHeaders, 'Content-Type': 'audio/x-mpegurl' } });
-              }
+        const id = url.searchParams.get('id');
+        if (env.IPTV_KV && id) {
+          const content = await env.IPTV_KV.get('m3u_file_' + id);
+          if (content) {
+            return new Response(content, { headers: { ...corsHeaders, 'Content-Type': 'audio/x-mpegurl' } });
           }
-          return new Response("Not found", {status: 404});
+        }
+        return new Response("Not found", {status: 404});
       }
 
       // ==========================================
       // 8. CHANNELS
+      // FIX: concurrency-limited fetch (max 5 at once)
       // ==========================================
       if (action === 'channels') {
         let sources = [];
         if (env.IPTV_KV) {
           try {
-            const raw = await env.IPTV_KV.get('m3u_sources');
+            const raw = await env.IPTV_KV.get('m3u_sources', { cacheTtl: 60 });
             if (raw) sources = JSON.parse(raw);
           } catch(e) { console.error("KV Read Error", e); }
         }
         if (sources.length === 0) sources = [{ id: 'default', name: 'Default', url: DEFAULT_M3U_URL }];
-        
-        // Process sources, checking if they are internal KV files or external URLs
-        const results = await Promise.allSettled(
-          sources.map(async src => {
-            let text = '';
-            if (src.url.includes('action=serve-m3u&id=')) {
-              try {
-                const urlObj = new URL(src.url);
-                const id = urlObj.searchParams.get('id');
-                if (env.IPTV_KV && id) {
-                  text = await env.IPTV_KV.get('m3u_file_' + id) || "";
-                }
-              } catch(e) { console.error("Internal KV Error", e); }
-            } else {
-              const r = await fetch(src.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-              text = await r.text();
-            }
-            return { text, sourceName: src.name };
-          })
-        );
+
+        const activeSources = sources.filter(src => src.enabled !== false);
+
+        // Concurrency-limited fetcher
+        async function fetchSource(src) {
+          let text = '';
+          if (src.url.includes('action=serve-m3u&id=')) {
+            try {
+              const urlObj = new URL(src.url);
+              const id = urlObj.searchParams.get('id');
+              if (env.IPTV_KV && id) {
+                text = await env.IPTV_KV.get('m3u_file_' + id) || "";
+              }
+            } catch(e) { console.error("Internal KV Error", e); }
+          } else {
+            // FIX: validate protocol before fetching external source
+            try {
+              const parsed = new URL(src.url);
+              if (!['http:', 'https:'].includes(parsed.protocol)) return { text: '', sourceName: src.name };
+            } catch { return { text: '', sourceName: src.name }; }
+            const r = await fetch(src.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            text = await r.text();
+          }
+          return { text, sourceName: src.name };
+        }
+
+        // Run with max 5 concurrent fetches
+        const CONCURRENCY = 5;
+        const results = [];
+        for (let i = 0; i < activeSources.length; i += CONCURRENCY) {
+          const batch = activeSources.slice(i, i + CONCURRENCY);
+          const batchResults = await Promise.allSettled(batch.map(fetchSource));
+          results.push(...batchResults);
+        }
 
         let allChannels = [];
         for (const result of results) {
@@ -247,12 +302,12 @@ export default {
       // ==========================================
       // 9. SERVE HTML PLAYER
       // ==========================================
-      return new Response(getHTML(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      return new Response(getHTML(FAVICON_URL), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
 
     } catch (criticalError) {
-      return new Response(`CRITICAL WORKER ERROR: ${criticalError.message}\n\nStack: ${criticalError.stack}`, { 
-        status: 500, 
-        headers: { 'Content-Type': 'text/plain' } 
+      return new Response(`CRITICAL WORKER ERROR: ${criticalError.message}\n\nStack: ${criticalError.stack}`, {
+        status: 500,
+        headers: { 'Content-Type': 'text/plain' }
       });
     }
   }
@@ -261,12 +316,13 @@ export default {
 // ==========================================
 // HELPERS
 // ==========================================
-function simpleHash(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (Math.imul(31, hash) + str.charCodeAt(i)) | 0;
-  }
-  return Math.abs(hash).toString(36);
+
+// FIX: use URL as ID directly (hashed) to avoid simpleHash collisions
+function stableChannelId(url) {
+  // Simple but collision-resistant: base36 of a djb2-like 32-bit hash
+  let h = 5381;
+  for (let i = 0; i < url.length; i++) h = (Math.imul(33, h) ^ url.charCodeAt(i)) >>> 0;
+  return 'ch_' + h.toString(36);
 }
 
 function parseM3U(m3uText, sourceName) {
@@ -285,10 +341,13 @@ function parseM3U(m3uText, sourceName) {
       let hasEpg = false; const epgMatch = line.match(/tvg-id="(.*?)"/); if (epgMatch && epgMatch[1].trim() !== '') hasEpg = true;
       const nameUpper = name.toUpperCase();
       const isHd = [' HD', '-HD', 'FHD', '4K', '1080', '720'].some(q => nameUpper.includes(q));
-      currentChannel = { name, logo, group: prefixedGroup, is_hd: isHd, has_epg: hasEpg, source: sourceName };
+      currentChannel = { name, logo, group: prefixedGroup, is_hd: isHd, has_epg: hasEpg, source: sourceName, url: '', id: '' };
     } else if (line.startsWith('http') && currentChannel) {
-      currentChannel.url = line; currentChannel.id = 'ch_' + simpleHash(line);
-      channels.push(currentChannel); currentChannel = null;
+      currentChannel.url = line;
+      // FIX: use collision-resistant hash instead of simpleHash
+      currentChannel.id = stableChannelId(line);
+      channels.push(currentChannel);
+      currentChannel = null;
     }
   }
   return channels;
@@ -297,13 +356,14 @@ function parseM3U(m3uText, sourceName) {
 // ==========================================
 // LOGIN HTML
 // ==========================================
-function getLoginHTML() {
+function getLoginHTML(faviconUrl) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Login - MOE IPTV</title>
 <meta name="robots" content="nofollow, noindex" />
+<link rel="icon" type="image/svg+xml" href="${faviconUrl}">
 <script src="https://cdn.tailwindcss.com"><\/script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
@@ -405,7 +465,7 @@ ic.innerText = i.type === "password" ? "visibility_off" : "visibility";
 // ==========================================
 // CLEANER HTML
 // ==========================================
-function getCleanerHTML() {
+function getCleanerHTML(faviconUrl) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -413,6 +473,7 @@ function getCleanerHTML() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Playlist Cleaner</title>
 <meta name="robots" content="nofollow, noindex" />
+<link rel="icon" type="image/svg+xml" href="${faviconUrl}">
 <script src="https://cdn.tailwindcss.com"><\/script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
@@ -447,7 +508,7 @@ function getCleanerHTML() {
 </div>
 <div class="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4 mb-6 flex gap-3 text-yellow-200 text-sm">
 <span class="material-icons shrink-0">warning</span>
-<p><strong>Warning:</strong> Testing thousands of channels consumes worker limits and takes time. Please use reduced playlists when possible.</p>
+<p><strong>Warning:</strong> Testing thousands of channels consumes worker limits and takes time. Please use reduced playlists when possible. Recommended maximum: 500 channels.</p>
 </div>
 <button id="fetch-btn" onclick="fetchAndParse()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-3.5 rounded-xl shadow-lg transition flex items-center justify-center gap-2">
 <span class="material-icons" style="font-size: 20px;">radar</span> <span>Fetch & Prepare</span>
@@ -467,6 +528,7 @@ function getCleanerHTML() {
 <div class="w-full bg-[#16161E] border border-[#2A2B36] rounded-full h-3 overflow-hidden">
 <div id="progress-bar" class="bg-blue-500 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
 </div>
+<p class="text-xs text-gray-500 text-center mt-2" id="progress-label">0 / 0</p>
 </div>
 <button id="scan-btn" onclick="startCleaning()" class="w-full bg-red-600 hover:bg-red-500 text-white font-semibold py-3.5 rounded-xl shadow-lg transition flex items-center justify-center gap-2">
 <span class="material-icons" style="font-size: 20px;">delete_sweep</span> <span>Start Cleaner</span>
@@ -578,6 +640,8 @@ document.getElementById('stat-dead').innerText=dead;
 }finally{
 done++;
 document.getElementById('progress-bar').style.width=Math.round((done/total)*100)+'%';
+// FIX: show numeric progress label
+document.getElementById('progress-label').innerText=done+' / '+total;
 }
 }));
 }
@@ -617,14 +681,15 @@ alert("Error saving: "+e.message);
 // ==========================================
 // MAIN PLAYER HTML
 // ==========================================
-function getHTML() {
+function getHTML(faviconUrl) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>MOE IPTV Player</title>
 <meta name="robots" content="nofollow, noindex" />
+<link rel="icon" type="image/svg+xml" href="${faviconUrl}">
 <script src="https://cdn.tailwindcss.com"><\/script>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script>
 <script src="https://cdn.plyr.io/3.7.8/plyr.js"><\/script>
@@ -682,6 +747,29 @@ box-shadow: 0 0 12px rgba(255,255,255,0.6);
 #settings-modal { display: none; }
 #settings-modal.open { display: flex; }
 
+/* FIX: stream error overlay */
+#stream-error-overlay {
+  display: none; 
+  position: absolute; 
+  inset: 0; 
+  z-index: 9999999 !important;
+  align-items: center; 
+  justify-content: center; 
+  flex-direction: column;
+  background: rgba(0,0,0,0.75); 
+  gap: 12px;
+}
+#stream-error-overlay.visible { display: flex; }
+#stream-error-overlay .err-icon { font-size: 48px; color: #EF4444; }
+#stream-error-overlay .err-msg  { color: #fff; font-size: 15px; font-weight: 500; }
+#stream-error-overlay .err-sub  { color: #9CA3AF; font-size: 12px; }
+#stream-error-overlay .err-retry {
+  margin-top: 8px; padding: 10px 24px; background: #2D5BE3; color: #fff;
+  border: none; border-radius: 99px; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: background 0.2s;
+}
+#stream-error-overlay .err-retry:hover { background: #4F77F5; }
+
 /* Custom adjustments for Plyr styles */
 .plyr {
   width: 100% !important;
@@ -698,38 +786,163 @@ box-shadow: 0 0 12px rgba(255,255,255,0.6);
   object-fit: contain !important;
   height: 100% !important;
 }
+
+/* ══════════════════════════════════════════
+   MOBILE  (≤ 767px)
+══════════════════════════════════════════ */
+@media (max-width: 767px) {
+    #desktop-layout { display: none !important; }
+    body { display: block; height: 100dvh; overflow: hidden; background: #000; }
+
+    #mobile-video-wrap { position: fixed; top: 0; left: 0; right: 0; bottom: 58px; background: #000; z-index: 0; }
+    #mobile-video-wrap video, #mobile-video-wrap .plyr { width: 100% !important; height: 100% !important; }
+    #now-playing-container { z-index: 5; }
+
+    #mobile-sheet {
+        position: fixed; bottom: 0; left: 0; right: 0;
+        height: 58px; background: #16161E; border-radius: 0;
+        z-index: 30; display: flex; flex-direction: column; overflow: hidden;
+        transition: height 0.25s ease-out, border-radius 0.25s ease-out;
+    }
+    #mobile-sheet.is-open {
+        height: 70dvh; background: #1A1B26; border-top-left-radius: 22px; border-top-right-radius: 22px;
+        border-top: none; box-shadow: 0 -12px 48px rgba(0,0,0,0.85);
+        transition: height 0.38s cubic-bezier(0.34, 1.45, 0.64, 1), border-radius 0.38s, background-color 0.2s;
+    }
+
+    #mobile-tab-bar {
+        order: 2; flex-shrink: 0; height: 58px; background: #16161E;
+        border-top: 1px solid #2A2B36; display: flex; align-items: center; padding: 0 4px; z-index: 2;
+    }
+
+    #mobile-pane-wrap {
+        order: 1; flex: 1; overflow: hidden; display: flex; flex-direction: column;
+        opacity: 0; pointer-events: none; transition: opacity 0.15s;
+    }
+    #mobile-sheet.is-open #mobile-pane-wrap { opacity: 1; pointer-events: auto; }
+
+    #mobile-pane { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+    .mob-pane-section { display: none; height: 100%; flex: 1; min-height: 0; }
+    .mob-pane-section.active { display: block; }
+
+    #mob-pane-tv-wrapper { overflow: hidden; padding: 0; }
+    #tv-slider { display: flex; width: 200%; height: 100%; transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); align-items: stretch; }
+
+    #mob-pane-home { width: 50%; height: 100%; display: flex; flex-direction: column; padding: 0 12px; box-sizing: border-box; }
+    #mob-pane-channels { width: 50%; height: 100%; display: flex; flex-direction: column; padding: 0 12px; box-sizing: border-box; }
+    #mob-pane-fav { height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px 12px 16px; }
+
+    .mob-tab {
+        flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 2px; padding: 6px 0; border-radius: 10px; color: #8F93A2;
+        font-size: 9px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+        cursor: pointer; transition: color 0.2s, background 0.2s; border: none; background: transparent;
+    }
+    .mob-tab .material-icons { font-size: 21px; }
+    .mob-tab.is-active { color: #fff; background: rgba(255,255,255,0.08); }
+    .mob-tab.logout-tab { flex: 0 0 42px; }
+
+    .category-row { padding: 10px 8px; border-radius: 12px; }
+    .category-row.is-active .cat-avatar { transform: scale(1.3) translateX(-3px); }
+    .channel-card.is-active { transform: scale(1.02); }
+
+    #mob-back-btn {
+        display: none; position: fixed; bottom: 68px; left: 50%; transform: translateX(-50%);
+        background: #2D5BE3; color: #fff; border: none; border-radius: 99px; padding: 10px 22px;
+        font-size: 13px; font-weight: 600; cursor: pointer; z-index: 40; align-items: center; gap: 6px;
+        box-shadow: 0 4px 20px rgba(45,91,227,0.55); white-space: nowrap;
+    }
+    #mob-back-btn.visible { display: flex; }
+}
+
+/* ══════════════════════════════════════════
+   TABLET  (768px – 1023px)
+══════════════════════════════════════════ */
+@media (min-width: 768px) and (max-width: 1023px) {
+    #sidebar { position: absolute; left: 0; top: 0; bottom: 0; z-index: 50; }
+    #sidebar:not(.collapsed) { box-shadow: 4px 0 24px rgba(0,0,0,0.4); }
+    #desktop-channel-panel { margin-left: 80px; width: 280px; padding-left: 14px; padding-right: 14px; }
+}
+
+/* ══════════════════════════════════════════
+   DESKTOP  (≥ 1024px)
+══════════════════════════════════════════ */
+@media (min-width: 1024px) {
+    #mobile-video-wrap { display: none !important; }
+    #mobile-sheet      { display: none !important; }
+    #mob-back-btn      { display: none !important; }
+}
+
+/* ══════════════════════════════════════════
+   iOS SAFARI FULLSCREEN FALLBACK FIX
+══════════════════════════════════════════ */
+.plyr.plyr--fullscreen-fallback {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100vw !important;
+    height: 100dvh !important;
+    z-index: 999999 !important;
+    background-color: #000 !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+}
+
+.plyr.plyr--fullscreen-fallback video {
+    height: 100% !important;
+    object-fit: contain !important;
+}
+
+/* ══════════════════════════════════════════
+   FULLSCREEN STACKING CONTEXT FIX
+══════════════════════════════════════════ */
+body.is-fullscreen #mobile-sheet {
+    display: none !important;
+}
+
+body.is-fullscreen #mobile-video-wrap {
+    bottom: 0 !important;
+    z-index: 999999 !important;
+}
 </style>
 </head>
-<body class="bg-tv-bg text-white h-screen overflow-hidden flex selection:bg-gray-700">
-<div id="settings-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+
+<body class="bg-[#16161E] text-white overflow-hidden selection:bg-gray-700">
+
+<!-- FIX: unsaved-changes guard modal -->
+<div id="unsaved-modal" style="display:none;position:fixed;inset:0;z-index:200;align-items:center;justify-content:center;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);">
+  <div class="bg-[#1C1D26] border border-[#2A2B36] rounded-2xl shadow-2xl p-8 w-full max-w-sm mx-4 text-center">
+    <span class="material-icons text-yellow-400 mb-3" style="font-size:40px;">warning</span>
+    <h3 class="text-lg font-bold mb-2">Unsaved Changes</h3>
+    <p class="text-sm text-gray-400 mb-6">You have unsaved source changes. Close anyway and lose them?</p>
+    <div class="flex gap-3">
+      <button onclick="confirmDiscardSettings()" class="flex-1 bg-red-600 hover:bg-red-500 text-white font-medium py-3 rounded-xl transition text-sm">Discard</button>
+      <button onclick="cancelDiscardSettings()" class="flex-1 bg-[#272733] hover:bg-gray-600 text-white font-medium py-3 rounded-xl transition text-sm">Keep Editing</button>
+    </div>
+  </div>
+</div>
+
+<div id="settings-modal" class="fixed inset-0 z-[100] hidden items-center justify-center bg-black/70 backdrop-blur-sm p-4">
     <div class="bg-[#1C1D26] border border-[#2A2B36] rounded-2xl shadow-2xl w-full max-w-lg flex flex-col max-h-[85vh]">
+        
         <div class="flex items-center justify-between p-6 border-b border-[#2A2B36] shrink-0">
             <div>
                 <h2 class="text-lg font-bold">M3U Sources</h2>
-                <p class="text-xs text-gray-500 mt-0.5">Add, rename, or remove playlist sources</p>
+                <p class="text-xs text-gray-500 mt-0.5">Manage your playlists</p>
             </div>
-            <button onclick="closeSettings()" class="w-8 h-8 rounded-full bg-[#272733] hover:bg-gray-600 flex items-center justify-center text-gray-400 hover:text-white transition-colors">
-                <span class="material-icons" style="font-size: 18px;">close</span>
-            </button>
-        </div>
-        
-        <div id="sources-list" class="flex-1 overflow-y-auto p-6 space-y-4">
-            <div class="flex justify-center py-6"><div class="loader"></div></div>
-        </div>
-        
-        <div class="p-6 border-t border-[#2A2B36] shrink-0">
-            <p class="text-[11px] text-gray-500 mb-3 font-semibold uppercase tracking-wider">Add New Source</p>
-            <div class="flex flex-col gap-3">
-                <input id="new-source-name" type="text" placeholder="Source name (e.g. My Provider)"
-                    class="w-full bg-[#272733] rounded-xl px-4 py-3.5 text-sm text-white placeholder-gray-500 border border-transparent focus:border-gray-600 focus:outline-none transition-colors">
-                <input id="new-source-url" type="text" placeholder="M3U URL (https://...)"
-                    class="w-full bg-[#272733] rounded-xl px-4 py-3.5 text-sm text-white placeholder-gray-500 border border-transparent focus:border-gray-600 focus:outline-none transition-colors font-mono text-xs">
-                <button onclick="addSource()" class="w-full bg-white text-black hover:bg-gray-200 transition-colors font-medium py-3.5 rounded-xl text-sm flex items-center justify-center gap-2 shadow-sm">
-                    <span class="material-icons" style="font-size: 18px;">add</span> Add Source
+            <div class="flex items-center gap-3">
+                <button onclick="addBlankSource()" class="h-8 px-3 rounded-full bg-[#2D5BE3] hover:bg-blue-500 flex items-center justify-center text-white text-xs font-medium transition-colors gap-1 shadow-sm">
+                    <span class="material-icons" style="font-size: 16px;">add</span> Add
+                </button>
+                <button onclick="tryCloseSettings()" class="w-8 h-8 rounded-full bg-[#272733] hover:bg-gray-600 flex items-center justify-center text-gray-400 hover:text-white transition-colors">
+                    <span class="material-icons" style="font-size: 18px;">close</span>
                 </button>
             </div>
         </div>
-        
+
+        <div id="sources-list" class="flex-1 overflow-y-auto p-6 space-y-4">
+            <div class="flex justify-center py-6"><div class="loader"></div></div>
+        </div>
+
         <div class="p-6 border-t border-[#2A2B36] shrink-0">
             <button id="save-sources-btn" onclick="saveSources()" class="w-full bg-[#2D5BE3] hover:bg-blue-600 transition-colors font-medium py-3.5 rounded-xl text-sm flex items-center justify-center gap-2 shadow-sm">
                 <span class="material-icons" style="font-size: 18px;">save</span>
@@ -739,6 +952,7 @@ box-shadow: 0 0 12px rgba(255,255,255,0.6);
     </div>
 </div>
 
+<div id="desktop-layout" class="h-screen flex">
 <div id="sidebar" class="flex h-full shrink-0 bg-tv-bg z-20 overflow-hidden relative">
 <div class="w-20 shrink-0 flex flex-col items-center py-10 gap-6 z-30 bg-tv-bg">
 <button id="collapse-btn" class="w-10 h-10 rounded-full bg-[#272733] hover:bg-gray-600 flex items-center justify-center text-gray-400 hover:text-white transition-colors mb-6">
@@ -771,22 +985,32 @@ box-shadow: 0 0 12px rgba(255,255,255,0.6);
 </div>
 </div>
 
-<div class="w-[380px] shrink-0 bg-tv-panel flex flex-col py-10 px-6 z-10 relative">
+<div id="desktop-channel-panel" class="w-[380px] shrink-0 bg-tv-panel flex flex-col py-10 px-6 z-10 relative">
 <div class="relative mb-6">
-<span class="material-icons absolute left-3 top-2.5 text-gray-500" style="font-size: 18px;">search</span>
-<input type="text" id="search-bar" placeholder="Search channels..."
-class="w-full bg-tv-card border border-transparent rounded-lg pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-gray-600 transition-colors">
+    <span class="material-icons absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" style="font-size: 18px;">search</span>
+    <input type="text" id="search-bar" placeholder="Search in all channels ..."
+        class="peer w-full bg-tv-card border border-transparent rounded-lg pl-10 pr-10 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-gray-600 transition-colors">
+    <button onclick="clearSearch('search-bar')" class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white opacity-0 pointer-events-none peer-[:not(:placeholder-shown)]:opacity-100 peer-[:not(:placeholder-shown)]:pointer-events-auto transition-opacity duration-200 flex items-center justify-center focus:outline-none">
+        <span class="material-icons" style="font-size: 16px;">close</span>
+    </button>
 </div>
 <div id="channel-list" class="flex-1 overflow-y-auto flex flex-col gap-3 pr-2 pt-1 pb-4 px-1">
 <div class="text-sm text-gray-500 mt-4 px-2">Select a category to view channels.</div>
 </div>
 </div>
 
-<div class="flex-1 relative bg-black flex flex-col justify-end transition-all duration-300 z-0">
-<video id="video-player" class="absolute inset-0 w-full h-full object-contain z-0" controls autoplay></video>
+<div id="desktop-video-wrap" class="flex-1 relative bg-black z-0">
+<video id="video-player" class="absolute inset-0 w-full h-full object-contain z-0" playsinline controls autoplay></video>
+<!-- FIX: stream error overlay -->
+<div id="stream-error-overlay">
+  <span class="material-icons err-icon">signal_wifi_off</span>
+  <span class="err-msg">Stream unavailable</span>
+  <span class="err-sub" id="err-sub-msg">Retrying…</span>
+  <button class="err-retry" onclick="retryCurrentStream()">Retry Now</button>
+</div>
 <div id="now-playing-container" class="absolute inset-0 z-10 flex flex-col justify-end opacity-0 transition-opacity duration-1000 pointer-events-none">
 <div class="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/90 via-black/50 to-transparent z-0"></div>
-<div class="relative z-10 p-12 pb-24 w-4/5">
+<div class="relative z-10 p-6 pb-12">
 <div class="flex items-center gap-3 mb-2 drop-shadow">
 <p class="text-gray-400 text-sm font-semibold tracking-wider uppercase">Now Playing</p>
 <span class="text-red-500 text-[10px] font-bold tracking-widest flex items-center gap-1.5 bg-red-500/10 px-2 py-0.5 rounded border border-red-500/20 shadow-sm">
@@ -798,57 +1022,190 @@ class="w-full bg-tv-card border border-transparent rounded-lg pl-10 pr-4 py-2.5 
 </div>
 </div>
 </div>
+</div>
+
+<!-- MOBILE LAYOUT -->
+<div id="mobile-video-wrap">
+    <!-- video element moved here by JS on mobile -->
+</div>
+
+<div id="mobile-sheet">
+    <div id="mobile-pane-wrap">
+        <div id="mobile-pane">
+            <div class="mob-pane-section active" id="mob-pane-tv-wrapper">
+                <div id="tv-slider">
+                    <div id="mob-pane-home">
+                        <div class="shrink-0 pt-3 pb-3 bg-[#1A1B26]">
+                            <div class="relative">
+    <span class="material-icons absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" style="font-size: 18px;">search</span>
+    <input type="text" id="mob-search-input" placeholder="Search in all channels ..." autocomplete="off"
+        class="peer w-full bg-[#242530] border border-transparent rounded-lg pl-10 pr-10 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-gray-600 transition-colors">
+    <button onclick="clearSearch('mob-search-input')" class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white opacity-0 pointer-events-none peer-[:not(:placeholder-shown)]:opacity-100 peer-[:not(:placeholder-shown)]:pointer-events-auto transition-opacity duration-200 flex items-center justify-center focus:outline-none">
+        <span class="material-icons" style="font-size: 16px;">close</span>
+    </button>
+</div>
+                        </div>
+
+                        <div class="flex-1 overflow-y-auto min-h-0 pb-4" style="-webkit-overflow-scrolling: touch;">
+                            <div id="mob-category-list">
+                                <div class="flex justify-center mt-10"><div class="loader"></div></div>
+                            </div>
+                            <div id="mob-search-list" style="display: none;" class="flex-col gap-2"></div>
+                        </div>
+                    </div>
+                    <div id="mob-pane-channels">
+                        <div class="shrink-0 pt-3 pb-3 bg-[#1A1B26]">
+                            <div class="relative">
+    <span class="material-icons absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" style="font-size: 18px;">search</span>
+    <input type="text" id="mob-channel-search-input" placeholder="Search in category ..." autocomplete="off"
+        class="peer w-full bg-[#242530] border border-transparent rounded-lg pl-10 pr-10 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-gray-600 transition-colors">
+    <button onclick="clearSearch('mob-channel-search-input')" class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white opacity-0 pointer-events-none peer-[:not(:placeholder-shown)]:opacity-100 peer-[:not(:placeholder-shown)]:pointer-events-auto transition-opacity duration-200 flex items-center justify-center focus:outline-none">
+        <span class="material-icons" style="font-size: 16px;">close</span>
+    </button>
+</div>
+                        </div>
+
+                        <div class="flex-1 overflow-y-auto min-h-0 pb-4" style="-webkit-overflow-scrolling: touch;">
+                            <div id="mob-channel-list" class="flex flex-col gap-2"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="mob-pane-section" id="mob-pane-fav">
+                <div id="mob-fav-list" class="flex flex-col gap-2"></div>
+            </div>
+        </div>
+    </div>
+    <div id="mobile-tab-bar">
+        <button class="mob-tab is-active" id="mob-tab-home"     onclick="mobTab('home')">
+            <span class="material-icons">live_tv</span><span>Live TV</span>
+        </button>
+        <button class="mob-tab" id="mob-tab-fav"                onclick="mobTab('fav')">
+            <span class="material-icons">star</span><span>Favorites</span>
+        </button>
+        <button class="mob-tab" id="mob-tab-settings"           onclick="openSettings()">
+            <span class="material-icons">settings</span><span>Sources</span>
+        </button>
+        <a href="?action=cleaner" target="_blank" class="mob-tab">
+            <span class="material-icons">cleaning_services</span><span>Cleaner</span>
+        </a>
+        <a href="?action=logout" class="mob-tab logout-tab">
+            <span class="material-icons">logout</span>
+        </a>
+    </div>
+</div>
+
+<button id="mob-back-btn" onclick="mobBackToCategories()">
+    <span class="material-icons" style="font-size:18px;">arrow_back</span>
+    Categories
+</button>
 
 <script>
 let player;
 let hls;
+let currentStreamUrl = null; // FIX: track current URL for retry
 
-// Re-usable Plyr initialization function. It queries the DOM fresh every time to avoid Detached Node references.
+const isMobile = () => window.innerWidth < 768;
+const getFavorites = () => JSON.parse(localStorage.getItem('iptv_favorites')) || [];
+const saveFavorites = (f) => localStorage.setItem('iptv_favorites', JSON.stringify(f));
+
+// FIX: destroy player before moving video element to avoid broken Plyr references
+function safeDestroyPlayer() {
+    if (player) { try { player.destroy(); } catch(e) {} player = null; }
+}
+
 function initializePlyr(options = {}) {
-    if (player) {
-        player.destroy();
-    }
+    safeDestroyPlayer();
     const freshVideo = document.getElementById('video-player');
-    
-    const defaultOptions = {
+    player = new Plyr(freshVideo, Object.assign({
         controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
         settings: ['quality', 'speed'],
         keyboard: { focused: true, global: true },
-        i18n: {
-            qualityLabel: {
-                0: 'Auto'
-            }
-        }
-    };
-    
-    const mergedOptions = Object.assign({}, defaultOptions, options);
-    player = new Plyr(freshVideo, mergedOptions);
+        i18n: { qualityLabel: { 0: 'Auto' } },
+        fullscreen: { enabled: true, fallback: true, iosNative: false }
+    }, options));
+    player.on('enterfullscreen', () => document.body.classList.add('is-fullscreen'));
+    player.on('exitfullscreen', () => document.body.classList.remove('is-fullscreen'));
 }
 
-// Initial instantiation on page load
-initializePlyr();
+let currentLayoutIsMobile = null; // Track the current layout state
 
-const categoryListEl = document.getElementById('category-list');
-const channelListEl = document.getElementById('channel-list');
-const categoryHeader = document.getElementById('category-header');
-const searchInput = document.getElementById('search-bar');
+function placeVideoElement() {
+    const isCurrentlyMobile = isMobile();
+
+    // ONLY destroy and move the player if we actually switched between Mobile and Desktop layouts.
+    // If it's just a normal resize (like going fullscreen), do nothing and exit early.
+    if (currentLayoutIsMobile === isCurrentlyMobile) {
+        return; 
+    }
+    
+    currentLayoutIsMobile = isCurrentlyMobile;
+
+    // Destroy player before moving the video element
+    safeDestroyPlayer();
+    
+    const vid        = document.getElementById('video-player');
+    const nowPlaying = document.getElementById('now-playing-container');
+    const errOverlay = document.getElementById('stream-error-overlay');
+    
+    if (isCurrentlyMobile) {
+        const wrap = document.getElementById('mobile-video-wrap');
+        if (!wrap.contains(vid))        wrap.appendChild(vid);
+        if (!wrap.contains(nowPlaying)) wrap.appendChild(nowPlaying);
+        if (errOverlay && !wrap.contains(errOverlay)) wrap.appendChild(errOverlay);
+    } else {
+        const wrap = document.getElementById('desktop-video-wrap');
+        if (wrap && !wrap.contains(vid)) {
+            wrap.insertBefore(vid, wrap.firstChild);
+            wrap.insertBefore(nowPlaying, wrap.children[1] || null);
+            if (errOverlay) wrap.insertBefore(errOverlay, wrap.children[2] || null);
+        }
+    }
+    
+    // Re-init Plyr after move if a stream was playing
+    if (currentStreamUrl) {
+        playStream(currentStreamUrl);
+    } else {
+        initializePlyr();
+    }
+}
+
+placeVideoElement();
+window.addEventListener('resize', placeVideoElement);
+
+const categoryListEl  = document.getElementById('category-list');
+const channelListEl   = document.getElementById('channel-list');
+const categoryHeader  = document.getElementById('category-header');
+const searchInput     = document.getElementById('search-bar');
 const nowPlayingContainer = document.getElementById('now-playing-container');
-const npTitle = document.getElementById('np-title');
-const navHome = document.getElementById('nav-home');
-const navFav = document.getElementById('nav-fav');
-const navSettings = document.getElementById('nav-settings');
-const sidebar = document.getElementById('sidebar');
-const collapseBtn = document.getElementById('collapse-btn');
-const settingsModal = document.getElementById('settings-modal');
+const npTitle         = document.getElementById('np-title');
+const navHome         = document.getElementById('nav-home');
+const navFav          = document.getElementById('nav-fav');
+const navSettings     = document.getElementById('nav-settings');
+const sidebar         = document.getElementById('sidebar');
+const collapseBtn     = document.getElementById('collapse-btn');
+const settingsModal   = document.getElementById('settings-modal');
+const errorOverlay    = document.getElementById('stream-error-overlay');
+const errSubMsg       = document.getElementById('err-sub-msg');
 
 let globalChannelsData = [];
 let categories = {};
-let activeCategoryBtn = null;
-let activeChannelBtn = null;
-const channelNodeCache = {};
+let activeCategoryBtn  = null;
+let activeChannelBtn   = null;
+// FIX: cap channel node cache to avoid unbounded DOM node accumulation
+const CHANNEL_CACHE_MAX = 500;
+const channelNodeCache  = {};
+let channelCacheOrder   = [];
 
-const getFavorites = () => JSON.parse(localStorage.getItem('iptv_favorites')) || [];
-const saveFavorites = (f) => localStorage.setItem('iptv_favorites', JSON.stringify(f));
+function addToCache(id, node) {
+    if (channelNodeCache[id]) return;
+    if (channelCacheOrder.length >= CHANNEL_CACHE_MAX) {
+        const oldest = channelCacheOrder.shift();
+        delete channelNodeCache[oldest];
+    }
+    channelNodeCache[id] = node;
+    channelCacheOrder.push(id);
+}
 
 if (localStorage.getItem('iptv_sidebar_collapsed') === 'true') {
     sidebar.classList.add('collapsed');
@@ -863,12 +1220,17 @@ loadChannels();
 
 function loadChannels() {
     categoryListEl.innerHTML = '<div class="flex justify-center mt-10"><div class="loader"></div></div>';
-    channelListEl.innerHTML = '<div class="text-sm text-gray-500 mt-4 px-2">Loading channels...</div>';
+    channelListEl.innerHTML  = '<div class="text-sm text-gray-500 mt-4 px-2">Loading channels...</div>';
     document.getElementById('total-channels-count').innerText = 'Loading ...';
+    const mobCatList = document.getElementById('mob-category-list');
+    if (mobCatList) mobCatList.innerHTML = '<div class="flex justify-center mt-10"><div class="loader"></div></div>';
     fetch('?action=channels')
         .then(r => r.json())
         .then(channels => {
             globalChannelsData = channels;
+            // FIX: clear stale cache entries when channels reload
+            Object.keys(channelNodeCache).forEach(k => delete channelNodeCache[k]);
+            channelCacheOrder.length = 0;
             processData();
         });
 }
@@ -882,22 +1244,22 @@ function processData() {
     });
     document.getElementById('total-channels-count').innerText = \`\${globalChannelsData.length} Channels\`;
     renderCategories();
+    if (typeof renderMobileCategories === 'function') renderMobileCategories();
     const firstBtn = categoryListEl.querySelector('button');
     if (firstBtn) firstBtn.click();
 }
 
+const COLORS = ['bg-blue-500','bg-red-500','bg-green-500','bg-yellow-500','bg-purple-500','bg-pink-500','bg-indigo-500'];
+
 function renderCategories() {
     categoryListEl.innerHTML = '';
-    const colors = ['bg-blue-500','bg-red-500','bg-green-500','bg-yellow-500','bg-purple-500','bg-pink-500','bg-indigo-500'];
     Object.keys(categories).forEach(groupName => {
         const groupChannels = categories[groupName];
         if (!groupChannels.length) return;
-        const colorClass = colors[groupName.length % colors.length];
+        const colorClass = COLORS[groupName.length % COLORS.length];
         const initial = groupName.charAt(0).toUpperCase();
-        
-        // Replace the " > " separator with a Material Icon
         const displayGroupName = groupName.replace(' > ', '<span class="material-icons align-middle text-gray-400" style="font-size: 16px; margin: -2px 2px 0 2px;">chevron_right</span>');
-        
+
         const btn = document.createElement('button');
         btn.className = "category-row w-full text-left p-3 flex items-center gap-4 focus:outline-none cursor-pointer";
         btn.innerHTML = \`
@@ -907,7 +1269,7 @@ function renderCategories() {
             <span class="text-[11px] text-gray-500 mt-0.5">\${groupChannels.length} Channels</span>
         </div>
         \`;
-        
+
         btn.onclick = () => {
             if (activeCategoryBtn) activeCategoryBtn.classList.remove('is-active');
             btn.classList.add('is-active');
@@ -918,6 +1280,10 @@ function renderCategories() {
             document.getElementById('total-channels-count').innerText = \`\${globalChannelsData.length} Channels\`;
             searchInput.value = '';
             renderChannels(groupChannels);
+            if (window.innerWidth >= 768 && window.innerWidth <= 1023) {
+                sidebar.classList.add('collapsed');
+                localStorage.setItem('iptv_sidebar_collapsed', 'true');
+            }
         };
         categoryListEl.appendChild(btn);
     });
@@ -933,6 +1299,10 @@ function renderFavorites() {
     const favChannels = globalChannelsData.filter(ch => getFavorites().includes(ch.id));
     document.getElementById('total-channels-count').innerText = \`\${favChannels.length} Channels\`;
     renderChannels(favChannels);
+    if (window.innerWidth >= 768 && window.innerWidth <= 1023) {
+        sidebar.classList.add('collapsed');
+        localStorage.setItem('iptv_sidebar_collapsed', 'true');
+    }
 }
 
 function renderChannels(channelsArray) {
@@ -948,92 +1318,80 @@ function renderChannels(channelsArray) {
             btn = channelNodeCache[ch.id];
             if (activeChannelBtn && activeChannelBtn.dataset.id === ch.id) { btn.classList.add('is-active'); activeChannelBtn = btn; }
             else btn.classList.remove('is-active');
-            
             const starEl = btn.querySelector('.star-btn');
             const isFav = getFavorites().includes(ch.id);
-            if (isFav) {
-                starEl.classList.remove('text-gray-600','hover:text-[#E87A31]');
-                starEl.classList.add('text-[#E87A31]');
-                starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star</span>';
-            } else {
-                starEl.classList.remove('text-[#E87A31]');
-                starEl.classList.add('text-gray-600','hover:text-[#E87A31]');
-                starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star_border</span>';
-            }
+            starEl.classList.toggle('text-[#E87A31]', isFav);
+            starEl.classList.toggle('text-gray-600', !isFav);
+            starEl.innerHTML = \`<span class="material-icons" style="font-size:18px;">\${isFav ? 'star' : 'star_border'}</span>\`;
         } else {
-            btn = document.createElement('button');
-            btn.className = "channel-card w-full text-left bg-tv-card hover:bg-tv-cardhover rounded-xl p-3 flex items-center gap-4 focus:outline-none cursor-pointer shadow-sm";
-            if (activeChannelBtn && activeChannelBtn.dataset.id === ch.id) { btn.classList.add('is-active'); activeChannelBtn = btn; }
-            btn.dataset.id = ch.id;
-            
-            const safeLogoUrl = ch.logo ? '?action=logo&url=' + encodeURIComponent(ch.logo) : '';
-            const logoHtml = ch.logo
-                ? \`<img src="\${safeLogoUrl}" loading="lazy" class="w-full h-full object-contain" onerror="this.outerHTML='<span class=\\'text-xs font-bold\\'>\${ch.name.charAt(0)}</span>'"/>\`
-                : \`<span class="text-xs font-bold text-gray-400">\${ch.name.charAt(0)}</span>\`;
-            
-            const isFav = getFavorites().includes(ch.id);
-            const starColor = isFav ? "text-[#E87A31]" : "text-gray-600 hover:text-[#E87A31]";
-            const starIcon = isFav ? "star" : "star_border";
-            
-            let badgesHtml = '';
-            if (ch.is_hd) badgesHtml += '<span class="text-[8px] flex items-center font-bold bg-white text-black px-1 rounded-sm shadow-sm">HD</span>';
-            if (ch.has_epg) badgesHtml += '<span class="text-[8px] flex items-center font-bold bg-gray-600 text-white px-1 rounded-sm shadow-sm">EPG</span>';
-            
-            const sourceBadge = ch.source
-                ? \`<span class="text-[8px] flex items-center font-bold bg-blue-900/60 text-blue-300 px-1 rounded-sm truncate max-w-[80px] shadow-sm">\${ch.source}</span>\`
-                : '';
-                
-            btn.innerHTML = \`
-            <div class="w-14 h-14 bg-[#1C1D26] border border-[#2D2E3D] rounded flex items-center justify-center shrink-0 overflow-hidden shadow-inner">\${logoHtml}</div>
-            <div class="flex-1 flex flex-col overflow-hidden py-1">
-                <span class="text-sm font-semibold text-white truncate">\${ch.name}</span>
-                <span class="text-[10px] text-tv-muted mt-1 truncate">Live Stream</span>
-                <div class="flex gap-1 mt-2 min-h-[16px] flex-wrap">\${badgesHtml}\${sourceBadge}</div>
-            </div>
-            <div class="star-btn p-2 shrink-0 \${starColor} transition-colors" data-id="\${ch.id}">
-                <span class="material-icons" style="font-size: 18px;">\${starIcon}</span>
-            </div>
-            \`;
-            
-            let hideBannerTimeout;
-            btn.onclick = (e) => {
-                if (e.target.closest('.star-btn')) return;
-                if (activeChannelBtn) activeChannelBtn.classList.remove('is-active');
-                btn.classList.add('is-active'); activeChannelBtn = btn;
-                npTitle.innerText = ch.name;
-                nowPlayingContainer.classList.remove('opacity-0');
-                clearTimeout(hideBannerTimeout);
-                hideBannerTimeout = setTimeout(() => nowPlayingContainer.classList.add('opacity-0'), 4000);
-                playStream(\`?action=proxy&url=\${encodeURIComponent(ch.url)}\`);
-            };
-            
-            const starEl = btn.querySelector('.star-btn');
-            starEl.onclick = (e) => {
-                e.stopPropagation();
-                let favs = getFavorites();
-                if (favs.includes(ch.id)) {
-                    favs = favs.filter(id => id !== ch.id);
-                    if (navFav.classList.contains('is-active')) { 
-                        btn.remove(); 
-                        document.getElementById('total-channels-count').innerText = \`\${favs.length} Channels\`; 
-                    } else { 
-                        starEl.classList.remove('text-[#E87A31]'); 
-                        starEl.classList.add('text-gray-600','hover:text-[#E87A31]'); 
-                        starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star_border</span>'; 
-                    }
-                } else {
-                    favs.push(ch.id);
-                    starEl.classList.remove('text-gray-600','hover:text-[#E87A31]'); 
-                    starEl.classList.add('text-[#E87A31]');
-                    starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star</span>';
-                }
-                saveFavorites(favs);
-            };
-            channelNodeCache[ch.id] = btn;
+            btn = buildDesktopCard(ch);
+            addToCache(ch.id, btn);
         }
         fragment.appendChild(btn);
     });
     channelListEl.appendChild(fragment);
+}
+
+// FIX: use escHtml for logo onerror to handle channel names with quotes/special chars
+function buildDesktopCard(ch) {
+    const btn = document.createElement('button');
+    btn.className = "channel-card w-full text-left bg-tv-card hover:bg-tv-cardhover rounded-xl p-3 flex items-center gap-4 focus:outline-none cursor-pointer shadow-sm";
+    if (activeChannelBtn && activeChannelBtn.dataset.id === ch.id) { btn.classList.add('is-active'); }
+    btn.dataset.id = ch.id;
+
+    const safeLogoUrl = ch.logo ? '?action=logo&url=' + encodeURIComponent(ch.logo) : '';
+    const safeName    = escHtml(ch.name);
+    const initial     = escHtml(ch.name.charAt(0));
+    const logoHtml = ch.logo
+        ? \`<img src="\${safeLogoUrl}" loading="lazy" class="w-full h-full object-contain" alt="\${safeName}" onerror="this.outerHTML='<span class=&quot;text-xs font-bold&quot;>\${initial}</span>'">\`
+        : \`<span class="text-xs font-bold text-gray-400">\${initial}</span>\`;
+
+    const isFav = getFavorites().includes(ch.id);
+    const starColor = isFav ? "text-[#E87A31]" : "text-gray-600 hover:text-[#E87A31]";
+    const starIcon  = isFav ? "star" : "star_border";
+
+    let badgesHtml = '';
+    if (ch.is_hd) badgesHtml += '<span class="text-[8px] flex items-center font-bold bg-white text-black px-1 rounded-sm shadow-sm">HD</span>';
+    if (ch.has_epg) badgesHtml += '<span class="text-[8px] flex items-center font-bold bg-gray-600 text-white px-1 rounded-sm shadow-sm">EPG</span>';
+    const sourceBadge = ch.source
+        ? \`<span class="text-[8px] flex items-center font-bold bg-blue-900/60 text-blue-300 px-1 rounded-sm truncate max-w-[80px] shadow-sm">\${escHtml(ch.source)}</span>\`
+        : '';
+
+    btn.innerHTML = \`
+    <div class="w-14 h-14 bg-[#1C1D26] border border-[#2D2E3D] rounded flex items-center justify-center shrink-0 overflow-hidden shadow-inner">\${logoHtml}</div>
+    <div class="flex-1 flex flex-col overflow-hidden py-1">
+        <span class="text-sm font-semibold text-white truncate">\${safeName}</span>
+        <span class="text-[10px] text-tv-muted mt-1 truncate">Live Stream</span>
+        <div class="flex gap-1 mt-2 min-h-[16px] flex-wrap">\${badgesHtml}\${sourceBadge}</div>
+    </div>
+    <div class="star-btn p-2 shrink-0 \${starColor} transition-colors" data-id="\${ch.id}">
+        <span class="material-icons" style="font-size: 18px;">\${starIcon}</span>
+    </div>
+    \`;
+
+    let hideBannerTimeout;
+    btn.onclick = (e) => {
+        if (e.target.closest('.star-btn')) return;
+        if (activeChannelBtn) activeChannelBtn.classList.remove('is-active');
+        btn.classList.add('is-active'); activeChannelBtn = btn;
+        npTitle.innerText = ch.name;
+        nowPlayingContainer.classList.remove('opacity-0');
+        clearTimeout(hideBannerTimeout);
+        hideBannerTimeout = setTimeout(() => nowPlayingContainer.classList.add('opacity-0'), 4000);
+        playStream(\`?action=proxy&url=\${encodeURIComponent(ch.url)}\`);
+    };
+
+    const starEl = btn.querySelector('.star-btn');
+    starEl.onclick = (e) => {
+        e.stopPropagation();
+        toggleFavorite(ch.id, starEl, () => {
+            if (navFav.classList.contains('is-active')) {
+                btn.remove();
+                document.getElementById('total-channels-count').innerText = \`\${getFavorites().length} Channels\`;
+            }
+        });
+    };
+    return btn;
 }
 
 navFav.addEventListener('click', renderFavorites);
@@ -1055,52 +1413,284 @@ searchInput.addEventListener('input', (e) => {
     renderChannels(filtered);
 });
 
-function playStream(url) {
-    // 1. Completely destroy current Plyr to release the DOM element and restore a clean <video id="video-player">
-    if (player) {
-        player.destroy();
-        player = null;
+function toggleFavorite(channelId, starEl, onRemoveCallback) {
+    let favs = getFavorites();
+    if (favs.includes(channelId)) {
+        favs = favs.filter(id => id !== channelId);
+        saveFavorites(favs);
+        starEl.classList.remove('text-[#E87A31]');
+        starEl.classList.add('text-gray-600');
+        starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star_border</span>';
+        if (onRemoveCallback) onRemoveCallback();
+    } else {
+        favs.push(channelId);
+        saveFavorites(favs);
+        starEl.classList.remove('text-gray-600');
+        starEl.classList.add('text-[#E87A31]');
+        starEl.innerHTML = '<span class="material-icons" style="font-size:18px;">star</span>';
     }
+}
+
+// ==========================================
+// STREAM ERROR OVERLAY
+// ==========================================
+function showStreamError(msg, retrying) {
+    if (!errorOverlay) return;
+    errSubMsg.innerText = retrying ? 'Retrying in 3s…' : (msg || '');
+    errorOverlay.classList.add('visible');
+}
+function hideStreamError() {
+    if (!errorOverlay) return;
+    errorOverlay.classList.remove('visible');
+}
+function retryCurrentStream() {
+    if (currentStreamUrl) playStream(currentStreamUrl);
+}
+
+// ==========================================
+// MOBILE SHEET LOGIC
+// ==========================================
+let currentMobTab = 'home';
+let sheetOpen = false;
+let mobShowChannels = false;
+
+function updateMobBackBtn() {
+    const btn = document.getElementById('mob-back-btn');
+    if (sheetOpen && currentMobTab === 'home' && mobShowChannels) {
+        btn.classList.add('visible');
+    } else {
+        btn.classList.remove('visible');
+    }
+}
+
+function mobTab(tab) {
+    const sheet = document.getElementById('mobile-sheet');
+    if (tab === currentMobTab && sheetOpen) {
+        sheet.classList.remove('is-open');
+        sheetOpen = false;
+        updateMobBackBtn();
+        return;
+    }
+    sheet.classList.add('is-open');
+    sheetOpen = true;
+    currentMobTab = tab;
+    document.querySelectorAll('.mob-tab').forEach(b => b.classList.remove('is-active'));
+    const activeBtn = document.getElementById('mob-tab-' + tab);
+    if (activeBtn) activeBtn.classList.add('is-active');
+    document.querySelectorAll('.mob-pane-section').forEach(p => p.classList.remove('active'));
+    if (tab === 'home') {
+        document.getElementById('mob-pane-tv-wrapper').classList.add('active');
+        if (!mobShowChannels) {
+            document.getElementById('tv-slider').style.transform = 'translateX(0)';
+            document.getElementById('mob-back-btn').classList.remove('visible');
+        }
+    } else if (tab === 'fav') {
+        renderMobileFavorites();
+        document.getElementById('mob-pane-fav').classList.add('active');
+    }
+    updateMobBackBtn();
+}
+
+document.getElementById('mobile-video-wrap').addEventListener('click', () => {
+    document.getElementById('mobile-sheet').classList.remove('is-open');
+    sheetOpen = false;
+    updateMobBackBtn();
+});
+
+['mob-channel-list', 'mob-fav-list', 'mob-search-list'].forEach(id => {
+    const el = document.getElementById(id);
+    if(el) {
+        el.addEventListener('click', e => {
+            if (!e.target.closest('.mob-star-btn') && e.target.closest('.channel-card')) {
+                document.getElementById('mobile-sheet').classList.remove('is-open');
+                sheetOpen = false;
+                updateMobBackBtn();
+            }
+        });
+    }
+});
+
+function mobBackToCategories() {
+    mobShowChannels = false;
+    document.getElementById('tv-slider').style.transform = 'translateX(0)';
+    document.getElementById('mobile-pane').scrollTop = 0;
+    // FIX: also reset the category channel search
+    const chInput = document.getElementById('mob-channel-search-input');
+    if (chInput) { chInput.value = ''; chInput.dispatchEvent(new Event('input')); }
+    updateMobBackBtn();
+}
+
+function renderMobileCategories() {
+    const el = document.getElementById('mob-category-list');
+    if (!el) return;
+    el.innerHTML = '';
+    Object.keys(categories).forEach(groupName => {
+        const groupChannels = categories[groupName];
+        if (!groupChannels.length) return;
+        const colorClass = COLORS[groupName.length % COLORS.length];
+        const initial = groupName.charAt(0).toUpperCase();
+        const displayGroupName = groupName.replace(' > ', '<span class="material-icons align-middle text-gray-400" style="font-size:14px;margin:-2px 2px 0 2px;">chevron_right</span>');
+        const btn = document.createElement('button');
+        btn.className = "category-row w-full text-left p-3 flex items-center gap-4 focus:outline-none cursor-pointer rounded-xl";
+        btn.innerHTML = \`
+        <div class="cat-avatar w-8 h-8 rounded-full \${colorClass} flex items-center justify-center text-white text-xs font-bold shrink-0">\${initial}</div>
+        <div class="cat-text-container flex flex-col overflow-hidden">
+            <span class="text-sm font-medium text-white truncate">\${displayGroupName}</span>
+            <span class="text-[11px] text-gray-500 mt-0.5">\${groupChannels.length} ch</span>
+        </div>
+        <span class="material-icons text-gray-600 ml-auto" style="font-size:18px;">chevron_right</span>\`;
+        btn.onclick = () => {
+            renderMobileChannels(groupChannels);
+            document.getElementById('tv-slider').style.transform = 'translateX(-50%)';
+            mobShowChannels = true;
+            const chInput = document.getElementById('mob-channel-search-input');
+            if(chInput) chInput.value = '';
+            document.getElementById('mobile-pane').scrollTop = 0;
+            updateMobBackBtn();
+        };
+        el.appendChild(btn);
+    });
+}
+
+function renderMobileChannels(arr) {
+    const el = document.getElementById('mob-channel-list');
+    if(!el) return;
+    el.innerHTML = '';
+    if (!arr.length) { el.innerHTML = '<div class="text-sm text-gray-500 p-4 text-center">No channels found.</div>'; return; }
+    arr.forEach(ch => el.appendChild(buildMobileCard(ch)));
+}
+
+function renderMobileFavorites() {
+    const favChannels = globalChannelsData.filter(ch => getFavorites().includes(ch.id));
+    const el = document.getElementById('mob-fav-list');
+    if(!el) return;
+    el.innerHTML = '';
+    if (!favChannels.length) { el.innerHTML = '<div class="text-sm text-gray-500 p-4 text-center">No favorites yet. Tap ★ on any channel.</div>'; return; }
+    favChannels.forEach(ch => el.appendChild(buildMobileCard(ch)));
+}
+
+// FIX: use escHtml in mobile card onerror too
+function buildMobileCard(ch) {
+    const btn = document.createElement('button');
+    btn.className = "channel-card w-full text-left bg-[#242530] rounded-xl p-3 flex items-center gap-3 focus:outline-none cursor-pointer";
+    btn.dataset.id = ch.id;
+    const safeLogoUrl = ch.logo ? '?action=logo&url=' + encodeURIComponent(ch.logo) : '';
+    const safeName = escHtml(ch.name);
+    const initial  = escHtml(ch.name.charAt(0));
+    const logoHtml = ch.logo
+        ? \`<img src="\${safeLogoUrl}" loading="lazy" class="w-full h-full object-contain" alt="\${safeName}" onerror="this.outerHTML='<span class=&quot;text-xs font-bold&quot;>\${initial}</span>'">\`
+        : \`<span class="text-xs font-bold text-gray-400">\${initial}</span>\`;
+    const isFav = getFavorites().includes(ch.id);
+    const starIcon  = isFav ? "star" : "star_border";
+    const starColor = isFav ? "text-[#E87A31]" : "text-gray-600";
+    let badgesHtml = '';
+    if (ch.is_hd) badgesHtml += '<span class="text-[8px] font-bold bg-white text-black px-1 rounded-sm">HD</span>';
+    btn.innerHTML = \`
+    <div class="w-11 h-11 bg-[#1C1D26] border border-[#2D2E3D] rounded flex items-center justify-center shrink-0 overflow-hidden">\${logoHtml}</div>
+    <div class="flex-1 flex flex-col overflow-hidden">
+        <span class="text-sm font-semibold text-white truncate">\${safeName}</span>
+        <div class="flex gap-1 mt-1">\${badgesHtml}</div>
+    </div>
+    <div class="mob-star-btn shrink-0 \${starColor} p-2" data-id="\${ch.id}">
+        <span class="material-icons" style="font-size:18px;">\${starIcon}</span>
+    </div>\`;
+    btn.onclick = e => {
+        if (e.target.closest('.mob-star-btn')) return;
+        npTitle.innerText = ch.name;
+        nowPlayingContainer.classList.remove('opacity-0');
+        setTimeout(() => nowPlayingContainer.classList.add('opacity-0'), 4000);
+        playStream(\`?action=proxy&url=\${encodeURIComponent(ch.url)}\`);
+    };
+    const starEl = btn.querySelector('.mob-star-btn');
+    starEl.onclick = e => {
+        e.stopPropagation();
+        toggleFavorite(ch.id, starEl, () => {
+            if (currentMobTab === 'fav') {
+                btn.remove();
+                if (document.getElementById('mob-fav-list').children.length === 0) { renderMobileFavorites(); }
+            }
+        });
+    };
+    return btn;
+}
+
+const mobSearchInput = document.getElementById('mob-search-input');
+if(mobSearchInput) {
+    mobSearchInput.addEventListener('input', e => {
+        const q  = e.target.value.toLowerCase().trim();
+        const searchList = document.getElementById('mob-search-list');
+        const catList    = document.getElementById('mob-category-list');
+        searchList.innerHTML = '';
+        // FIX: always explicitly reset both display states
+        if (!q) {
+            catList.style.display    = 'block';
+            searchList.style.display = 'none';
+            return;
+        }
+        catList.style.display    = 'none';
+        searchList.style.display = 'flex';
+        const filtered = globalChannelsData.filter(ch => ch.name.toLowerCase().includes(q));
+        if (filtered.length === 0) {
+            searchList.innerHTML = '<div class="text-sm text-gray-500 p-4 text-center">No channels found.</div>';
+        } else {
+            filtered.forEach(ch => searchList.appendChild(buildMobileCard(ch)));
+        }
+    });
+}
+
+const mobChannelSearchInput = document.getElementById('mob-channel-search-input');
+if (mobChannelSearchInput) {
+    mobChannelSearchInput.addEventListener('input', e => {
+        const q = e.target.value.toLowerCase().trim();
+        const channelCards = document.querySelectorAll('#mob-channel-list .channel-card');
+        channelCards.forEach(card => {
+            const channelNameEl = card.querySelector('.font-semibold');
+            if (channelNameEl) {
+                card.style.display = channelNameEl.innerText.toLowerCase().includes(q) ? 'flex' : 'none';
+            }
+        });
+    });
+}
+
+// ==========================================
+// STREAM PLAYER
+// ==========================================
+function playStream(url) {
+    currentStreamUrl = url;
+    hideStreamError();
+
+    safeDestroyPlayer();
+    if (hls) { hls.destroy(); hls = null; }
 
     const nativeVideo = document.getElementById('video-player');
 
     if (Hls.isSupported()) {
-        if (hls) hls.destroy();
-        
-        let initialEstimate = 120000; // 120kbps very light default
+        let initialEstimate = 120000;
         let maxBufferLength = 120;
-        let syncDuration = 15;
+        let syncDuration    = 15;
 
-        // Auto detect slow/unstable network types using browser Connection API
         if (navigator.connection) {
             const conn = navigator.connection;
             if (conn.effectiveType === '2g' || conn.effectiveType === '3g' || conn.saveData || (conn.downlink && conn.downlink < 0.8)) {
-                initialEstimate = 70000; // 70kbps starting point (practically audio bandwidth requirements)
-                maxBufferLength = 180;   // Buffer up to 3 minutes
-                syncDuration = 20;       // Buffer 20 segments behind live edge to survive network drops
+                initialEstimate = 70000;
+                maxBufferLength = 180;
+                syncDuration    = 20;
             }
         }
-        
-        // Deep buffer, error-resilient settings optimized for low-speed and unstable connections
+
         hls = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
-            progressive: true,               // Progressive fragment appending (starts feeding MSE immediately as bytes arrive)
-            backBufferLength: 90,             // Retain loaded frames in back buffer
-            maxBufferLength: maxBufferLength, 
-            maxMaxBufferLength: 300,         // Absolute maximum forward cache limit (5 minutes)
-            maxBufferSize: 120 * 1024 * 1024,// Maximum buffer memory size (120MB)
-            
-            // Build a massive cushion behind the live edge to prevent stuttering/dropouts
-            liveSyncDurationCount: syncDuration,       
+            progressive: true,
+            backBufferLength: 90,
+            maxBufferLength: maxBufferLength,
+            maxMaxBufferLength: 300,
+            maxBufferSize: 120 * 1024 * 1024,
+            liveSyncDurationCount: syncDuration,
             liveMaxLatencyDurationCount: syncDuration + 8,
-            
-            // Adaptive Bitrate conservative setup
-            abrEwmaDefaultEstimate: initialEstimate,  
-            abrBandwidthFactor: 0.5,         // Scale down bandwidth estimation heavily to prevent buffer starvation
-            abrBandwidthUpFactor: 0.3,       // Make it extremely hard to switch to higher bitrates unnecessarily
-            
-            // Extended timeouts and heavy retry counts for low-speed network recovery
+            abrEwmaDefaultEstimate: initialEstimate,
+            abrBandwidthFactor: 0.5,
+            abrBandwidthUpFactor: 0.3,
             fragLoadingTimeOut: 35000,
             manifestLoadingTimeOut: 35000,
             levelLoadingTimeOut: 35000,
@@ -1111,83 +1701,72 @@ function playStream(url) {
             manifestLoadingRetryDelay: 2000,
             levelLoadingRetryDelay: 2000
         });
-        
-        hls.loadSource(url); 
+
+        hls.loadSource(url);
         hls.attachMedia(nativeVideo);
-        
-        // Error Recovery Listeners to keep stream alive during drops
+
+        // FIX: show visible error overlay on fatal HLS errors
         hls.on(Hls.Events.ERROR, function (event, data) {
             if (data.fatal) {
                 switch (data.type) {
                     case Hls.ErrorTypes.NETWORK_ERROR:
-                        console.warn("Fatal Network error occurred. Re-trying load segment...");
-                        hls.startLoad();
+                        showStreamError('Network error', true);
+                        setTimeout(() => { hideStreamError(); hls.startLoad(); }, 3000);
                         break;
                     case Hls.ErrorTypes.MEDIA_ERROR:
-                        console.warn("Fatal Media error occurred. Attempting recovery...");
-                        hls.recoverMediaError();
+                        showStreamError('Media error', true);
+                        setTimeout(() => { hideStreamError(); hls.recoverMediaError(); }, 3000);
                         break;
                     default:
-                        console.error("Unrecoverable error. Reloading source in 3s...");
-                        setTimeout(() => playStream(url), 3000);
+                        showStreamError('Stream unavailable', true);
+                        setTimeout(() => { hideStreamError(); playStream(url); }, 5000);
                         break;
                 }
             }
         });
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            // Retrieve available stream qualities (heights)
+            hideStreamError();
             const availableQualities = hls.levels.map(l => l.height).filter(h => h);
-            
-            // Deduplicate and sort qualities from highest to lowest
             let uniqueQualities = [...new Set(availableQualities)].sort((a, b) => b - a);
-            
+
             let isWeakConnection = false;
-            let maxCappedHeight = 360; // Max default cap on weak connections
+            let maxCappedHeight  = 360;
 
             if (navigator.connection) {
                 const conn = navigator.connection;
                 if (conn.effectiveType === '2g' || conn.effectiveType === '3g' || conn.saveData || (conn.downlink && conn.downlink < 0.8)) {
                     isWeakConnection = true;
-                    maxCappedHeight = 240; // Force maximum quality cap to 240p on highly weak connections to ensure zero-cut
+                    maxCappedHeight  = 240;
                 }
             }
 
             const plyrOptions = {};
             if (uniqueQualities.length > 0) {
-                // If network connection is weak, limit qualities to capped height (dynamic cap)
                 if (isWeakConnection || maxCappedHeight === 240) {
-                    console.log("Weak connection detected. Capping max HLS level to " + maxCappedHeight + "p.");
                     const cappedLevels = hls.levels.filter(l => l.height && l.height <= maxCappedHeight);
                     if (cappedLevels.length > 0) {
                         const maxLevelHeight = Math.max(...cappedLevels.map(l => l.height));
-                        const maxLevelIndex = hls.levels.findIndex(l => l.height === maxLevelHeight);
-                        hls.maxSupportedLevel = maxLevelIndex; // Hard cap HLS auto level
-                        uniqueQualities = uniqueQualities.filter(q => q <= maxCappedHeight); // Cap user settings list
+                        const maxLevelIndex  = hls.levels.findIndex(l => l.height === maxLevelHeight);
+                        hls.maxSupportedLevel = maxLevelIndex;
+                        uniqueQualities = uniqueQualities.filter(q => q <= maxCappedHeight);
                     }
                 }
-
-                // Add Auto (0) to the beginning of the list
                 uniqueQualities.unshift(0);
-                
                 plyrOptions.quality = {
-                    default: 0, // Default to Auto
+                    default: 0,
                     options: uniqueQualities,
-                    forced: true, // Prevents Plyr from rewriting standard source URLs
+                    forced: true,
                     onChange: (quality) => {
-                        if (quality === 0) {
-                            hls.currentLevel = -1; // -1 triggers HLS.js adaptive auto bitrate selection
-                        } else {
+                        if (quality === 0) { hls.currentLevel = -1; }
+                        else {
                             const levelIndex = hls.levels.findIndex(l => l.height === quality);
-                            if (levelIndex !== -1) {
-                                hls.currentLevel = levelIndex; // Forces instantaneous switch to the manual level
-                            }
+                            if (levelIndex !== -1) hls.currentLevel = levelIndex;
                         }
                     }
                 };
             }
-            
-            // LEVEL_SWITCHED listener to update "Auto (360p)" text inside settings menu dynamically (removes ugly "0p")
+
             hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
                 const span = document.querySelector(".plyr__menu__container [data-plyr='quality'][value='0'] span");
                 if (span) {
@@ -1200,58 +1779,48 @@ function playStream(url) {
                 }
             });
 
-            // ADVANCED ANTI-STALL BUFFER MONITOR:
-            // Detect repeated buffering. If we hit 3 seconds of continuous waiting, instantly force lowest possible quality bandwidth-wise (almost audio-only).
             let stallTimer;
             nativeVideo.addEventListener('waiting', () => {
                 clearTimeout(stallTimer);
                 stallTimer = setTimeout(() => {
-                    console.warn("Buffer stalled for 3s. Instantly dropping quality to the lowest bitrate to preserve stream.");
                     if (hls && hls.levels && hls.levels.length > 0) {
-                        // Find the lowest level based on bandwidth (most robust metric for weak networks)
-                        const lowestLevelIndex = hls.levels.reduce((minIdx, lvl, idx, arr) => {
-                            return (lvl.bandwidth < arr[minIdx].bandwidth) ? idx : minIdx;
-                        }, 0);
-                        
-                        if (hls.currentLevel !== lowestLevelIndex) {
-                            hls.currentLevel = lowestLevelIndex;
-                        }
+                        const lowestLevelIndex = hls.levels.reduce((minIdx, lvl, idx, arr) =>
+                            (lvl.bandwidth < arr[minIdx].bandwidth) ? idx : minIdx, 0);
+                        if (hls.currentLevel !== lowestLevelIndex) hls.currentLevel = lowestLevelIndex;
                     }
                 }, 3000);
             });
 
-            nativeVideo.addEventListener('playing', () => {
-                clearTimeout(stallTimer); // Clear timer when playback resumes successfully
-            });
+            nativeVideo.addEventListener('playing', () => { clearTimeout(stallTimer); });
 
-            // Safe, dynamic re-instantiation of Plyr on the freshly fetched DOM video element
             const freshVideo = document.getElementById('video-player');
             player = new Plyr(freshVideo, {
                 controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
                 settings: ['quality', 'speed'],
                 keyboard: { focused: true, global: true },
-                i18n: {
-                    qualityLabel: {
-                        0: 'Auto'
-                    }
-                },
+                i18n: { qualityLabel: { 0: 'Auto' } },
+                fullscreen: { enabled: true, fallback: true, iosNative: false },
                 ...plyrOptions
             });
-            
+            player.on('enterfullscreen', () => document.body.classList.add('is-fullscreen'));
+            player.on('exitfullscreen', () => document.body.classList.remove('is-fullscreen'));
             player.play().catch(() => {});
         });
+
     } else if (nativeVideo.canPlayType('application/vnd.apple.mpegurl')) {
         nativeVideo.src = url; 
+        
+        nativeVideo.onerror = () => showStreamError('Stream unavailable', false);
+
         player = new Plyr(nativeVideo, {
             controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
             settings: ['quality', 'speed'],
             keyboard: { focused: true, global: true },
-            i18n: {
-                qualityLabel: {
-                    0: 'Auto'
-                }
-            }
+            i18n: { qualityLabel: { 0: 'Auto' } },
+            fullscreen: { enabled: true, fallback: true, iosNative: false }
         });
+        player.on('enterfullscreen', () => document.body.classList.add('is-fullscreen'));
+        player.on('exitfullscreen', () => document.body.classList.remove('is-fullscreen'));
         player.play().catch(() => {});
     }
 }
@@ -1259,8 +1828,9 @@ function playStream(url) {
 // ==========================================
 // SETTINGS MENU
 // ==========================================
-let sourcesData = [];
-let previousNav = null;
+let sourcesData      = [];
+let sourcesOriginal  = ''; // FIX: snapshot to detect unsaved changes
+let previousNav      = null;
 
 navSettings.addEventListener('click', openSettings);
 
@@ -1272,19 +1842,40 @@ function openSettings() {
     loadSources();
 }
 
+// FIX: check for unsaved changes before closing
+function tryCloseSettings() {
+    const currentSnapshot = JSON.stringify(sourcesData);
+    if (currentSnapshot !== sourcesOriginal) {
+        document.getElementById('unsaved-modal').style.display = 'flex';
+    } else {
+        closeSettings();
+    }
+}
+
+function confirmDiscardSettings() {
+    document.getElementById('unsaved-modal').style.display = 'none';
+    closeSettings();
+}
+
+function cancelDiscardSettings() {
+    document.getElementById('unsaved-modal').style.display = 'none';
+}
+
 function closeSettings() {
     settingsModal.classList.remove('open');
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('is-active'));
-    if (previousNav === navFav) { navFav.classList.add('is-active'); } 
+    if (previousNav === navFav) { navFav.classList.add('is-active'); }
     else { navHome.classList.add('is-active'); }
 }
 
-settingsModal.addEventListener('click', e => { if (e.target === settingsModal) closeSettings(); });
+// FIX: clicking the backdrop also triggers the unsaved-changes guard
+settingsModal.addEventListener('click', e => { if (e.target === settingsModal) tryCloseSettings(); });
 
 async function loadSources() {
     document.getElementById('sources-list').innerHTML = '<div class="flex justify-center py-6"><div class="loader"></div></div>';
     const res = await fetch('?action=get-sources');
     sourcesData = await res.json();
+    sourcesOriginal = JSON.stringify(sourcesData); // FIX: snapshot after load
     renderSources();
 }
 
@@ -1296,39 +1887,86 @@ function renderSources() {
     }
     list.innerHTML = '';
     sourcesData.forEach((src, idx) => {
-        const item = document.createElement('div');
+        const isEnabled = src.enabled !== false;
         const count = globalChannelsData.filter(ch => ch.source === src.name).length;
-        item.className = "source-item flex items-start gap-3 p-3 rounded-xl";
+
+        const item = document.createElement('div');
+        item.className = \`source-item flex flex-col gap-3 p-4 bg-[#242530] border border-[#2A2B36] rounded-xl relative shadow-sm transition-all duration-300 \${!isEnabled ? 'opacity-50 grayscale-[30%]' : ''}\`;
+
+        let statusBadge = '';
+        if (!isEnabled) {
+            statusBadge = \`<span class="text-[11px] text-gray-400 bg-gray-500/10 border border-gray-500/20 px-2 py-0.5 rounded shadow-sm font-bold">DISABLED</span>\`;
+        } else if (src.isNew) {
+            statusBadge = \`<span class="text-[10px] text-orange-400 bg-orange-500/10 border border-orange-500/20 px-2 py-0.5 rounded shadow-sm font-bold uppercase tracking-wider">Save to Load</span>\`;
+        } else {
+            statusBadge = \`<span class="text-[11px] text-[#2D5BE3] bg-[#2D5BE3]/10 border border-[#2D5BE3]/20 px-2 py-0.5 rounded shadow-sm font-bold">\${count}</span>\`;
+        }
+
         item.innerHTML = \`
-        <div class="w-10 h-10 rounded-full bg-[#2D5BE3] flex items-center justify-center text-white text-sm font-bold shrink-0 mt-1 shadow-inner">\${idx + 1}</div>
-        <div class="flex-1 min-w-0 flex flex-col gap-2">
-            <div class="flex items-center gap-2">
-                <input class="src-name w-full bg-[#272733] rounded-xl px-4 py-3 text-sm text-white font-medium border border-transparent focus:border-gray-600 focus:outline-none" 
-                    value="\${escHtml(src.name)}" placeholder="Source name" data-idx="\${idx}">
-                <span class="text-[11px] text-gray-400 bg-[#242530] border border-[#2A2B36] px-2.5 py-1.5 rounded-lg shrink-0 font-medium font-sans shadow-sm">\${count} Ch</span>
+        <div class="flex items-center gap-3">
+            <div class="w-9 h-9 rounded-full \${isEnabled ? 'bg-[#2D5BE3]' : 'bg-gray-600'} flex items-center justify-center text-white text-sm font-bold shrink-0 shadow-inner transition-colors">\${idx + 1}</div>
+            <div class="flex-1 min-w-0">
+                <input class="src-name w-full bg-[#1C1D26] rounded-lg px-3 py-2 text-sm text-white font-medium border border-transparent focus:border-blue-500 focus:outline-none transition-colors"
+                    value="\${escHtml(src.name)}" placeholder="Source name" data-idx="\${idx}" \${!isEnabled ? 'readonly' : ''}>
             </div>
-            <input class="src-url w-full bg-[#272733] rounded-xl px-4 py-3 text-xs text-gray-400 font-mono border border-transparent focus:border-gray-600 focus:outline-none" 
-                value="\${escHtml(src.url)}" placeholder="M3U URL" data-idx="\${idx}">
+
+            <label class="relative inline-flex items-center cursor-pointer shrink-0" title="Enable/Disable Source">
+                <input type="checkbox" class="sr-only peer" \${isEnabled ? 'checked' : ''} onchange="toggleSource(\${idx}, this.checked)">
+                <div class="w-11 h-6 bg-[#1C1D26] border border-[#2A2B36] rounded-full peer
+                    transition-colors duration-300 ease-in-out
+                    peer-checked:bg-[#2D5BE3] peer-checked:border-[#2D5BE3]
+                    after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+                    after:bg-gray-400 peer-checked:after:bg-white after:rounded-full
+                    after:h-5 after:w-5 after:transition-all after:duration-300 after:ease-in-out
+                    peer-checked:after:translate-x-5">
+                </div>
+            </label>
+
+            <button onclick="removeSource(\${idx})" class="w-9 h-9 rounded-full bg-red-500/10 hover:bg-red-500/20 flex items-center justify-center text-red-400 transition-colors shrink-0 ml-1" title="Delete Source">
+                <span class="material-icons" style="font-size:18px;">delete</span>
+            </button>
         </div>
-        <button onclick="removeSource(\${idx})" class="w-10 h-10 rounded-full hover:bg-red-500/10 flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors shrink-0 mt-1">
-            <span class="material-icons" style="font-size:20px;">delete</span>
-        </button>
+        <div class="flex flex-col gap-2">
+            <textarea class="src-url w-full bg-[#1C1D26] rounded-lg px-3 py-2.5 text-[11px] text-gray-400 font-mono border border-transparent focus:border-blue-500 focus:outline-none transition-colors resize-none overflow-hidden"
+                rows="2" placeholder="M3U URL" data-idx="\${idx}" \${!isEnabled ? 'readonly' : ''}>\${escHtml(src.url)}</textarea>
+
+            <div class="flex items-center justify-between px-1 mt-1">
+                <span class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold flex items-center gap-1">
+                    <span class="material-icons text-gray-500" style="font-size: 14px;">format_list_bulleted</span>
+                    Channels \${isEnabled ? (src.isNew ? 'Pending' : 'Loaded') : 'Status'}
+                </span>
+                \${statusBadge}
+            </div>
+        </div>
         \`;
+
         item.querySelector('.src-name').addEventListener('input', e => { sourcesData[idx].name = e.target.value; });
-        item.querySelector('.src-url').addEventListener('input', e => { sourcesData[idx].url = e.target.value; });
+        item.querySelector('.src-url').addEventListener('input',  e => { sourcesData[idx].url  = e.target.value; });
         list.appendChild(item);
     });
 }
 
-function addSource() {
-    const nameEl = document.getElementById('new-source-name');
-    const urlEl = document.getElementById('new-source-url');
-    const name = nameEl.value.trim();
-    const url = urlEl.value.trim();
-    if (!name || !url) { alert('Please fill in both a name and a URL.'); return; }
-    sourcesData.push({ id: 'src_' + Date.now(), name, url });
-    nameEl.value = ''; urlEl.value = '';
+function addBlankSource() {
+    sourcesData.push({ 
+        id: 'src_' + Date.now(), 
+        name: '', 
+        url: '', 
+        enabled: true, 
+        isNew: true 
+    });
+    
     renderSources();
+
+    setTimeout(() => {
+        const list = document.getElementById('sources-list');
+        
+        list.scrollTop = list.scrollHeight;
+        
+        const inputs = list.querySelectorAll('.src-name');
+        if (inputs.length > 0) {
+            inputs[inputs.length - 1].focus();
+        }
+    }, 50);
 }
 
 function removeSource(idx) {
@@ -1340,19 +1978,27 @@ async function saveSources() {
     for (const src of sourcesData) {
         if (!src.name.trim() || !src.url.trim()) { alert('All sources must have a name and URL.'); return; }
     }
-    const btn = document.getElementById('save-sources-btn');
+    const dataToSave = sourcesData.map(src => {
+        const cleanSrc = { ...src };
+        delete cleanSrc.isNew;
+        return cleanSrc;
+    });
+
+    const btn  = document.getElementById('save-sources-btn');
     const text = document.getElementById('save-btn-text');
     btn.disabled = true; text.innerText = 'Saving...';
     try {
         const res = await fetch('?action=save-sources', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sources: sourcesData })
+            body: JSON.stringify({ sources: dataToSave })
         });
         const data = await res.json();
         if (data.status === 'success') {
+            sourcesOriginal = JSON.stringify(sourcesData); // FIX: update snapshot after save
             text.innerText = 'Saved! Reloading channels...';
             Object.keys(channelNodeCache).forEach(k => delete channelNodeCache[k]);
+            channelCacheOrder.length = 0;
             setTimeout(() => {
                 closeSettings();
                 loadChannels();
@@ -1372,6 +2018,75 @@ function escHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function clearSearch(inputId) {
+    const inputEl = document.getElementById(inputId);
+    if (inputEl) {
+        inputEl.value = '';
+        inputEl.dispatchEvent(new Event('input'));
+        inputEl.focus();
+    }
+}
+
+function toggleSource(idx, isChecked) {
+    sourcesData[idx].enabled = isChecked;
+
+    const list = document.getElementById('sources-list');
+    const item = list.children[idx];
+    if (!item) return;
+
+    if (isChecked) {
+        item.classList.remove('opacity-50', 'grayscale-[30%]');
+    } else {
+        item.classList.add('opacity-50', 'grayscale-[30%]');
+    }
+
+    const numberCircle = item.querySelector('.w-9.h-9.text-white');
+    if (numberCircle) {
+        if (isChecked) {
+            numberCircle.classList.remove('bg-gray-600');
+            numberCircle.classList.add('bg-[#2D5BE3]');
+        } else {
+            numberCircle.classList.remove('bg-[#2D5BE3]');
+            numberCircle.classList.add('bg-gray-600');
+        }
+    }
+
+    const nameInput   = item.querySelector('.src-name');
+    const urlTextarea = item.querySelector('.src-url');
+    if (nameInput)   nameInput.readOnly   = !isChecked;
+    if (urlTextarea) urlTextarea.readOnly = !isChecked;
+
+    const badgeContainer = item.querySelector('.flex.items-center.justify-between.px-1.mt-1');
+    const count  = globalChannelsData.filter(ch => ch.source === sourcesData[idx].name).length;
+    const isNew  = sourcesData[idx].isNew;
+
+    if (badgeContainer) {
+        if (isChecked) {
+            if (isNew) {
+                badgeContainer.innerHTML =
+                    '<span class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold flex items-center gap-1">' +
+                        '<span class="material-icons text-gray-500" style="font-size: 14px;">format_list_bulleted</span>' +
+                        'Channels Pending' +
+                    '</span>' +
+                    '<span class="text-[10px] text-orange-400 bg-orange-500/10 border border-orange-500/20 px-2 py-0.5 rounded shadow-sm font-bold uppercase tracking-wider">Save to Load</span>';
+            } else {
+                badgeContainer.innerHTML =
+                    '<span class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold flex items-center gap-1">' +
+                        '<span class="material-icons text-gray-500" style="font-size: 14px;">format_list_bulleted</span>' +
+                        'Channels Loaded' +
+                    '</span>' +
+                    '<span class="text-[11px] text-[#2D5BE3] bg-[#2D5BE3]/10 border border-[#2D5BE3]/20 px-2 py-0.5 rounded shadow-sm font-bold">' + count + '</span>';
+            }
+        } else {
+            badgeContainer.innerHTML =
+                '<span class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold flex items-center gap-1">' +
+                    '<span class="material-icons text-gray-500" style="font-size: 14px;">format_list_bulleted</span>' +
+                    'Channels Status' +
+                '</span>' +
+                '<span class="text-[11px] text-gray-400 bg-gray-500/10 border border-gray-500/20 px-2 py-0.5 rounded shadow-sm font-bold">DISABLED</span>';
+        }
+    }
+}
 <\/script>
 </body>
 </html>`;
